@@ -1,0 +1,17 @@
+{
+  "name": "anac-cron-job",
+  "version": "1.0.0",
+  "description": "Cron job server to keep ANAC backend alive",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
