@@ -3,150 +3,134 @@ const https = require('https');
 const http = require('http');
 require('dotenv').config();
 
-// Configuration
-const BACKEND_URL = process.env.BACKEND_URL || 'https://anac-backend.onrender.com';
+/* ================= CONFIG ================= */
+
+const BACKEND_URLS = (process.env.BACKEND_URLS )
+  .split(',')
+  .map(u => u.trim())
+  .filter(Boolean);
+
 const PING_ENDPOINT = process.env.PING_ENDPOINT || '/api/health';
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '*/5 * * * *'; // Every 5 minutes
+const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '* * * * *'; // every minute
+const PING_INTERVAL_MS = 10_000; // 🔥 ping every 10 seconds
+const REQUEST_TIMEOUT_MS = 7_000;
 const PORT = process.env.PORT || 3001;
 
-// Track ping statistics
-let stats = {
-  totalPings: 0,
-  successfulPings: 0,
-  failedPings: 0,
-  lastPingTime: null,
-  lastPingStatus: null,
-  lastResponseTime: null,
+/* ================= STATS ================= */
+
+const stats = {
+  servers: {},
+  globalStats: {
+    totalPings: 0,
+    successfulPings: 0,
+    failedPings: 0,
+  },
   startTime: new Date(),
 };
 
-// Ping function
-function pingBackend() {
-  const url = `${BACKEND_URL}${PING_ENDPOINT}`;
-  const startTime = Date.now();
+BACKEND_URLS.forEach(url => {
+  stats.servers[url] = {
+    totalPings: 0,
+    successfulPings: 0,
+    failedPings: 0,
+    lastPingTime: null,
+    lastPingStatus: null,
+    lastResponseTime: null,
+  };
+});
 
-  console.log(`[${new Date().toISOString()}] Pinging ${url}...`);
+/* ================= PING LOGIC ================= */
 
-  const protocol = url.startsWith('https') ? https : http;
+function pingServer(backendUrl) {
+  return new Promise(resolve => {
+    const url = backendUrl + PING_ENDPOINT;
+    const protocol = url.startsWith('https') ? https : http;
+    const start = Date.now();
 
-  const req = protocol.get(url, (res) => {
-    const responseTime = Date.now() - startTime;
+    const req = protocol.get(url, res => {
+      const responseTime = Date.now() - start;
 
-    stats.totalPings++;
-    stats.lastPingTime = new Date().toISOString();
-    stats.lastResponseTime = responseTime;
+      const serverStats = stats.servers[backendUrl];
+      serverStats.totalPings++;
+      serverStats.lastPingTime = new Date().toISOString();
+      serverStats.lastResponseTime = responseTime;
 
-    if (res.statusCode >= 200 && res.statusCode < 300) {
-      stats.successfulPings++;
-      stats.lastPingStatus = 'success';
-      console.log(`[${new Date().toISOString()}] Ping successful - Status: ${res.statusCode}, Response time: ${responseTime}ms`);
-    } else {
-      stats.failedPings++;
-      stats.lastPingStatus = 'failed';
-      console.log(`[${new Date().toISOString()}] Ping failed - Status: ${res.statusCode}, Response time: ${responseTime}ms`);
-    }
+      stats.globalStats.totalPings++;
 
-    // Consume response data to free up memory
-    res.resume();
-  });
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        serverStats.successfulPings++;
+        serverStats.lastPingStatus = 'success';
+        stats.globalStats.successfulPings++;
+      } else {
+        serverStats.failedPings++;
+        serverStats.lastPingStatus = 'failed';
+        stats.globalStats.failedPings++;
+      }
 
-  req.on('error', (error) => {
-    const responseTime = Date.now() - startTime;
+      res.resume();
+      resolve();
+    });
 
-    stats.totalPings++;
-    stats.failedPings++;
-    stats.lastPingTime = new Date().toISOString();
-    stats.lastPingStatus = 'error';
-    stats.lastResponseTime = responseTime;
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy();
+    });
 
-    console.error(`[${new Date().toISOString()}] Ping error: ${error.message}`);
-  });
+    req.on('error', () => {
+      const serverStats = stats.servers[backendUrl];
+      serverStats.totalPings++;
+      serverStats.failedPings++;
+      serverStats.lastPingTime = new Date().toISOString();
+      serverStats.lastPingStatus = 'error';
 
-  req.setTimeout(30000, () => {
-    req.destroy();
-    stats.totalPings++;
-    stats.failedPings++;
-    stats.lastPingTime = new Date().toISOString();
-    stats.lastPingStatus = 'timeout';
-    console.error(`[${new Date().toISOString()}] Ping timeout after 30 seconds`);
+      stats.globalStats.totalPings++;
+      stats.globalStats.failedPings++;
+      resolve();
+    });
   });
 }
 
-// Schedule the cron job
-console.log(`
-========================================
-   ANAC Backend Keep-Alive Service
-========================================
-Backend URL: ${BACKEND_URL}
-Ping Endpoint: ${PING_ENDPOINT}
-Schedule: ${CRON_SCHEDULE} (every 5 minutes)
-Started at: ${new Date().toISOString()}
-========================================
-`);
+async function pingAllServers() {
+  await Promise.all(BACKEND_URLS.map(pingServer));
+}
 
-// Validate cron expression
+/* ================= CRON ================= */
+
 if (!cron.validate(CRON_SCHEDULE)) {
-  console.error('Invalid cron schedule expression!');
+  console.error('❌ Invalid cron schedule');
   process.exit(1);
 }
 
-// Schedule the cron job
 cron.schedule(CRON_SCHEDULE, () => {
-  pingBackend();
+  console.log(`[CRON] Starting high-frequency pings...`);
+
+  const interval = setInterval(pingAllServers, PING_INTERVAL_MS);
+
+  setTimeout(() => {
+    clearInterval(interval);
+    console.log(`[CRON] Ping cycle finished`);
+  }, 60_000);
 });
 
-// Initial ping on startup
-console.log('[Startup] Running initial ping...');
-pingBackend();
+/* ================= HTTP SERVER ================= */
 
-// Create a simple HTTP server for health checks (useful for deployment platforms)
 const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
+  if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'running',
-      service: 'ANAC Cron Job',
-      backendUrl: BACKEND_URL,
-      schedule: CRON_SCHEDULE,
-      stats: {
-        ...stats,
-        uptime: Math.floor((Date.now() - stats.startTime.getTime()) / 1000) + ' seconds',
-        successRate: stats.totalPings > 0
-          ? ((stats.successfulPings / stats.totalPings) * 100).toFixed(2) + '%'
-          : 'N/A',
-      },
+      servers: BACKEND_URLS.length,
+      stats,
+      uptime: Math.floor((Date.now() - stats.startTime) / 1000) + 's',
     }, null, 2));
   } else if (req.url === '/ping') {
-    // Manual ping trigger
-    pingBackend();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Ping triggered manually' }));
+    pingAllServers();
+    res.end(JSON.stringify({ message: 'Manual ping triggered' }));
   } else {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
+    res.writeHead(404);
+    res.end();
   }
 });
 
 server.listen(PORT, () => {
-  console.log(`Health check server running on port ${PORT}`);
-  console.log(`Endpoints:`);
-  console.log(`  - GET /health - Check service status and stats`);
-  console.log(`  - GET /ping   - Trigger manual ping`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('SIGINT received. Shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+  console.log(`✅ Health server running on port ${PORT}`);
 });
